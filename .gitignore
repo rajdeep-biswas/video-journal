@@ -1,0 +1,26 @@
+# API keys
+keys.json
+
+# Data directories — keep folders, ignore contents
+source/*
+output/*
+subtitles/*
+transcriptions/*
+journal/*
+screenshots/*
+
+# But always track the placeholder files that preserve folder structure
+!source/.gitkeep
+!output/.gitkeep
+!subtitles/.gitkeep
+!transcriptions/.gitkeep
+!journal/.gitkeep
+!screenshots/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
