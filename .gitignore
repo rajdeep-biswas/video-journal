@@ -3,6 +3,7 @@ keys.json
 
 # Data directories — keep folders, ignore contents
 source/*
+*.mp4
 output/*
 subtitles/*
 transcriptions/*

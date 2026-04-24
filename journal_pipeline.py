@@ -273,10 +273,19 @@ Synthesise the BEST possible version:
 Return ONLY a JSON object matching the exact same schema as the inputs (no markdown fences)."""
 
 def build_chunk_prompt(video_name: str, chunk_start: float, chunk_end: float,
-                        total_duration: float, transcript: str) -> str:
+                        total_duration: float, transcript: str,
+                        is_screen_recording: bool = False) -> str:
     def fmt(s): m, sec = divmod(int(s), 60); return f"{m}:{sec:02d}"
+    recording_type = (
+        "a screen recording / video call — the person may be sharing their screen, "
+        "showing code, apps, documents, or a meeting. screenshot_worthy=true is appropriate "
+        "for most distinct screen-state changes."
+        if is_screen_recording else
+        "a personal webcam journal — screenshot_worthy=true ONLY when something is "
+        "physically shown or a clear action happens, NOT for talking-face moments."
+    )
     return f"""You are analyzing a 5-minute segment of a personal video journal.
-The person recorded themselves — talking, thinking aloud, showing their screen, working, introspecting.
+Recording type: {recording_type}
 
 Video: "{video_name}"
 Segment: {fmt(chunk_start)} – {fmt(chunk_end)}  (of {fmt(total_duration)} total)
@@ -329,8 +338,10 @@ def _parse(raw: str) -> dict:
     return json.loads(raw[raw.find("{"):raw.rfind("}")+1])
 
 def analyze_anthropic_chunk(client, video_name, chunk_start, chunk_end,
-                             total_duration, transcript) -> dict:
-    prompt = build_chunk_prompt(video_name, chunk_start, chunk_end, total_duration, transcript)
+                             total_duration, transcript,
+                             is_screen_recording=False) -> dict:
+    prompt = build_chunk_prompt(video_name, chunk_start, chunk_end, total_duration,
+                                transcript, is_screen_recording)
     resp = client.messages.create(
         model="claude-opus-4-7",
         max_tokens=MAX_TOKENS,
@@ -339,8 +350,10 @@ def analyze_anthropic_chunk(client, video_name, chunk_start, chunk_end,
     return _parse(resp.content[0].text)
 
 def analyze_openai_chunk(client, video_name, chunk_start, chunk_end,
-                          total_duration, transcript) -> dict:
-    prompt = build_chunk_prompt(video_name, chunk_start, chunk_end, total_duration, transcript)
+                          total_duration, transcript,
+                          is_screen_recording=False) -> dict:
+    prompt = build_chunk_prompt(video_name, chunk_start, chunk_end, total_duration,
+                                transcript, is_screen_recording)
     resp = client.chat.completions.create(
         model="gpt-4o",
         max_tokens=MAX_TOKENS,
@@ -611,21 +624,22 @@ def main():
         wmodel = whisper_mod.load_model(WHISPER_MODEL)
         print(f"  Model loaded  ({time.time()-t0:.1f}s)", flush=True)
 
-    mov_files = sorted(
-        list(SOURCE_DIR.glob("*.mov")) + list(SOURCE_DIR.glob("*.MOV")),
+    video_files = sorted(
+        [p for ext in ("*.mov", "*.MOV", "*.mp4", "*.MP4")
+         for p in SOURCE_DIR.glob(ext)],
         key=lambda p: p.name,
     )
 
-    if not mov_files:
-        print("No .mov files found in source/")
+    if not video_files:
+        print("No .mov or .mp4 files found in source/")
         return
 
-    print(f"\nFound {len(mov_files)} video(s) to process.", flush=True)
+    print(f"\nFound {len(video_files)} video(s) to process.", flush=True)
     entries = []
 
-    for idx, mov in enumerate(mov_files, 1):
+    for idx, mov in enumerate(video_files, 1):
         print(f"\n{'━'*60}", flush=True)
-        print(f"[{idx}/{len(mov_files)}]  {mov.name}", flush=True)
+        print(f"[{idx}/{len(video_files)}]  {mov.name}", flush=True)
         print(f"{'━'*60}", flush=True)
 
         stem     = mov.stem
@@ -663,17 +677,21 @@ def main():
                 print(f"  ⚠  {label}: no speech, skipping", flush=True)
                 continue
 
+            is_screen_recording = mov.suffix.lower() == ".mp4"
+
             step(f"Anthropic  →  {label}")
             t0 = time.time()
             ant_result = analyze_anthropic_chunk(
-                ant_client, mov.name, chunk_start, chunk_end, duration, chunk_text
+                ant_client, mov.name, chunk_start, chunk_end, duration, chunk_text,
+                is_screen_recording=is_screen_recording,
             )
             done("done", time.time() - t0)
 
             step(f"OpenAI     →  {label}")
             t0 = time.time()
             oai_result = analyze_openai_chunk(
-                oai_client, mov.name, chunk_start, chunk_end, duration, chunk_text
+                oai_client, mov.name, chunk_start, chunk_end, duration, chunk_text,
+                is_screen_recording=is_screen_recording,
             )
             done("done", time.time() - t0)
 
