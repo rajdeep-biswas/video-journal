@@ -7,6 +7,7 @@ Pipeline: MOV files -> Bengali SRT + transcriptions + multi-system AI journal Wo
 """
 
 import os
+import re
 import ssl
 import json
 import time
@@ -125,20 +126,37 @@ Return ONLY a JSON array (no markdown fences), each element:
 Segments should be 3–15 seconds each. Cover every word — do not skip anything."""
 
 def _gemini_transcribe_chunk(gemini_client, chunk_wav: Path, abs_start: float,
-                              seam_left: float, seam_right: float) -> list:
-    """Upload one audio chunk to Gemini, get segments, adjust to absolute timestamps."""
+                              seam_left: float, seam_right: float,
+                              max_retries: int = 5) -> list:
+    """Upload one audio chunk to Gemini, get segments, adjust to absolute timestamps.
+
+    Retries on 429 RESOURCE_EXHAUSTED using the delay suggested by the API,
+    falling back to exponential backoff if not parseable.
+    """
     from google.genai import types as gt
+    from google.genai.errors import ClientError
 
     uploaded = gemini_client.files.upload(file=chunk_wav)
     try:
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_TRANSCRIBE_MODEL,
-            contents=[
-                gt.Part.from_uri(file_uri=uploaded.uri, mime_type="audio/wav"),
-                GEMINI_TRANSCRIBE_PROMPT,
-            ],
-            config=gt.GenerateContentConfig(max_output_tokens=MAX_TOKENS),
-        )
+        for attempt in range(max_retries):
+            try:
+                resp = gemini_client.models.generate_content(
+                    model=GEMINI_TRANSCRIBE_MODEL,
+                    contents=[
+                        gt.Part.from_uri(file_uri=uploaded.uri, mime_type="audio/wav"),
+                        GEMINI_TRANSCRIBE_PROMPT,
+                    ],
+                    config=gt.GenerateContentConfig(max_output_tokens=MAX_TOKENS),
+                )
+                break  # success
+            except ClientError as e:
+                if e.status_code != 429 or attempt == max_retries - 1:
+                    raise
+                m = re.search(r"retry in ([\d.]+)s", str(e))
+                wait = float(m.group(1)) + 2 if m else min(60 * 2 ** attempt, 300)
+                print(f"\n  ⏳  Gemini 429 — waiting {wait:.0f}s before retry "
+                      f"(attempt {attempt + 1}/{max_retries})...", flush=True)
+                time.sleep(wait)
     finally:
         try:
             gemini_client.files.delete(name=uploaded.name)
