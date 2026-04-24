@@ -27,8 +27,13 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-WHISPER_MODEL    = "small"
-WHISPER_LANGUAGE = "bn"          # Bengali Unicode output; set None for auto-detect
+# Transcription: "gemini" (recommended — handles Bengali/English code-switching)
+#                "whisper" (local, offline fallback)
+TRANSCRIPTION_PROVIDER = "gemini"
+GEMINI_TRANSCRIBE_MODEL = "gemini-2.0-flash"
+
+WHISPER_MODEL    = "small"       # only used if TRANSCRIPTION_PROVIDER = "whisper"
+WHISPER_LANGUAGE = "bn"          # only used if TRANSCRIPTION_PROVIDER = "whisper"
 
 CHUNK_DURATION   = 300           # 5 minutes per chunk (seconds)
 CHUNK_OVERLAP    = 10            # overlap between consecutive chunks (seconds)
@@ -106,27 +111,88 @@ def _chunk_spans(duration: float):
         yield abs_start, audio_len, seam_left, seam_right
         i += 1
 
-def transcribe_chunked(mov: Path, wmodel, duration: float, language=None) -> tuple:
-    """Transcribe in CHUNK_DURATION chunks with CHUNK_OVERLAP-second overlaps.
+GEMINI_TRANSCRIBE_PROMPT = """\
+Transcribe this audio with high accuracy.
 
-    Returns (all_segments, full_text, chunk_transcripts) where chunk_transcripts
-    is a list of (chunk_abs_start, chunk_duration, text) for LLM analysis.
-    Temp audio files are created and deleted inside a TemporaryDirectory.
-    """
-    spans = list(_chunk_spans(duration))
-    all_segs: list = []
-    chunk_transcripts: list = []
+The speaker freely mixes Bengali and English (code-switching is normal — do not force one language).
+- Bengali speech → Bengali Unicode script (বাংলা), NOT romanised/transliterated
+- English speech → English exactly as spoken
+- Filler sounds (উম, এই, hmm, uh) → include them, they're part of the journal
 
+Return ONLY a JSON array (no markdown fences), each element:
+{"start": <seconds from start of THIS clip>, "end": <seconds>, "text": "..."}
+
+Segments should be 3–15 seconds each. Cover every word — do not skip anything."""
+
+def _gemini_transcribe_chunk(gemini_client, chunk_wav: Path, abs_start: float,
+                              seam_left: float, seam_right: float) -> list:
+    """Upload one audio chunk to Gemini, get segments, adjust to absolute timestamps."""
+    from google.genai import types as gt
+
+    uploaded = gemini_client.files.upload(file=chunk_wav)
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_TRANSCRIBE_MODEL,
+            contents=[
+                gt.Part.from_uri(file_uri=uploaded.uri, mime_type="audio/wav"),
+                GEMINI_TRANSCRIBE_PROMPT,
+            ],
+            config=gt.GenerateContentConfig(max_output_tokens=MAX_TOKENS),
+        )
+    finally:
+        try:
+            gemini_client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+    raw = resp.text
+    start_idx = raw.find("[")
+    end_idx   = raw.rfind("]") + 1
+    segs = json.loads(raw[start_idx:end_idx])
+
+    kept = []
+    for seg in segs:
+        seg["start"] += abs_start
+        seg["end"]   += abs_start
+        if seam_left <= seg["start"] < seam_right:
+            kept.append(seg)
+    return kept
+
+def _whisper_transcribe_chunk(wmodel, chunk_wav: Path, abs_start: float,
+                               seam_left: float, seam_right: float,
+                               language: str = None) -> list:
+    """Transcribe one audio chunk with Whisper, adjust to absolute timestamps."""
     kwargs = {"verbose": False, "task": "transcribe"}
     if language:
         kwargs["language"] = language
+    result = wmodel.transcribe(str(chunk_wav), **kwargs)
+    kept = []
+    for seg in result["segments"]:
+        seg = dict(seg)
+        seg["start"] += abs_start
+        seg["end"]   += abs_start
+        if seam_left <= seg["start"] < seam_right:
+            kept.append(seg)
+    return kept
+
+def transcribe_chunked(mov: Path, duration: float,
+                        gemini_client=None, wmodel=None) -> tuple:
+    """Transcribe in CHUNK_DURATION chunks with CHUNK_OVERLAP-second overlaps.
+
+    Uses Gemini if gemini_client is provided, otherwise falls back to wmodel (Whisper).
+    Returns (all_segments, full_text, chunk_transcripts).
+    Temp WAV files live only inside a TemporaryDirectory — nothing written to disk permanently.
+    """
+    spans  = list(_chunk_spans(duration))
+    all_segs: list = []
+    chunk_transcripts: list = []
+    provider_label = "Gemini" if gemini_client else "Whisper"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         for idx, (abs_start, audio_len, seam_left, seam_right) in enumerate(
-            tqdm(spans, desc="  whisper chunks", unit="chunk")
+            tqdm(spans, desc=f"  {provider_label} chunks", unit="chunk")
         ):
-            # Extract audio chunk to temp WAV
             chunk_wav = tmp / f"chunk_{idx:03d}.wav"
             subprocess.run(
                 ["ffmpeg", "-y", "-ss", str(abs_start), "-t", str(audio_len),
@@ -134,20 +200,17 @@ def transcribe_chunked(mov: Path, wmodel, duration: float, language=None) -> tup
                 capture_output=True, check=True,
             )
 
-            result = wmodel.transcribe(str(chunk_wav), **kwargs)
-
-            # Adjust timestamps to absolute and filter to this chunk's seam window
-            kept = []
-            for seg in result["segments"]:
-                seg = dict(seg)                     # shallow copy — don't mutate whisper's output
-                seg["start"] += abs_start
-                seg["end"]   += abs_start
-                if seam_left <= seg["start"] < seam_right:
-                    kept.append(seg)
+            if gemini_client:
+                kept = _gemini_transcribe_chunk(
+                    gemini_client, chunk_wav, abs_start, seam_left, seam_right
+                )
+            else:
+                kept = _whisper_transcribe_chunk(
+                    wmodel, chunk_wav, abs_start, seam_left, seam_right,
+                    language=WHISPER_LANGUAGE,
+                )
 
             all_segs.extend(kept)
-
-            # Build per-chunk text for LLM (non-overlapping window)
             chunk_text = " ".join(s["text"].strip() for s in kept)
             chunk_transcripts.append((abs_start, audio_len, chunk_text))
 
@@ -528,11 +591,25 @@ def main():
     ant_client = anthropic_sdk.Anthropic(api_key=anthropic_key)
     oai_client = OpenAI(api_key=openai_key)
 
+    # ── Transcription client ───────────────────────────────────────────────────
+    gemini_client = None
+    wmodel        = None
     t0_total = time.time()
-    print(f"\nLoading whisper model ({WHISPER_MODEL})...", flush=True)
-    t0 = time.time()
-    wmodel = whisper.load_model(WHISPER_MODEL)
-    print(f"  Model loaded  ({time.time()-t0:.1f}s)", flush=True)
+
+    if TRANSCRIPTION_PROVIDER == "gemini":
+        gemini_key = load_key("gemini")
+        if not gemini_key:
+            print("ERROR: gemini key not found in keys.json — needed for transcription")
+            return
+        from google import genai as google_genai
+        gemini_client = google_genai.Client(api_key=gemini_key)
+        print(f"\nTranscription: Gemini ({GEMINI_TRANSCRIBE_MODEL})", flush=True)
+    else:
+        print(f"\nLoading Whisper model ({WHISPER_MODEL})...", flush=True)
+        t0 = time.time()
+        import whisper as whisper_mod
+        wmodel = whisper_mod.load_model(WHISPER_MODEL)
+        print(f"  Model loaded  ({time.time()-t0:.1f}s)", flush=True)
 
     mov_files = sorted(
         list(SOURCE_DIR.glob("*.mov")) + list(SOURCE_DIR.glob("*.MOV")),
@@ -557,11 +634,11 @@ def main():
 
         # ── Chunked transcription ─────────────────────────────────────────────
         n_chunks = max(1, int(duration // CHUNK_DURATION) + (1 if duration % CHUNK_DURATION else 0))
-        lang_label = WHISPER_LANGUAGE or "auto"
-        step(f"Whisper transcription — {n_chunks} chunk(s) × 5 min  (language={lang_label})")
+        provider_label = "Gemini" if gemini_client else f"Whisper ({WHISPER_LANGUAGE})"
+        step(f"{provider_label} transcription — {n_chunks} chunk(s) × 5 min")
         t0 = time.time()
         segments, full_text, chunk_transcripts = transcribe_chunked(
-            mov, wmodel, duration, language=WHISPER_LANGUAGE
+            mov, duration, gemini_client=gemini_client, wmodel=wmodel
         )
         done(f"Transcribed {n_chunks} chunk(s)", time.time() - t0)
 
